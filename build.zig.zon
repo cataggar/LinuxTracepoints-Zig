@@ -1,0 +1,12 @@
+.{
+    .name = .linux_tracepoints,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "LICENSE",
+        "src",
+    },
+    .fingerprint = 0x427cad32ae843933,
+}
