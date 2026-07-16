@@ -7,6 +7,7 @@
         "build.zig.zon",
         "LICENSE",
         "src",
+        "tests",
     },
     .fingerprint = 0x427cad32ae843933,
 }

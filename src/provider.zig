@@ -282,13 +282,28 @@ pub fn Provider(comptime provider_spec: ProviderSpec) type {
                 payload: *const Payload(event_id),
                 options: WriteOptions,
             ) WriteError!user_events.WriteOutcome {
+                return self.writePtrWith(
+                    event_id,
+                    payload,
+                    options,
+                    submitManaged,
+                );
+            }
+
+            fn writePtrWith(
+                self: *const Instance,
+                comptime event_id: EventId,
+                payload: *const Payload(event_id),
+                options: WriteOptions,
+                comptime submit: anytype,
+            ) WriteError!user_events.WriteOutcome {
                 const set_index = generated_event_to_set[@intFromEnum(event_id)];
                 const managed_event = &self.events[set_index];
                 if (!managed_event.isEnabled()) return .disabled;
                 return EventWriter(
                     provider_spec,
                     @intFromEnum(event_id),
-                ).emit(managed_event, payload, options, submitManaged);
+                ).emit(managed_event, payload, options, submit);
             }
 
             pub inline fn write(
@@ -307,13 +322,30 @@ pub fn Provider(comptime provider_spec: ProviderSpec) type {
                 comptime builder: anytype,
                 options: WriteOptions,
             ) WriteError!user_events.WriteOutcome {
+                return self.writeLazyWith(
+                    event_id,
+                    context,
+                    builder,
+                    options,
+                    submitManaged,
+                );
+            }
+
+            fn writeLazyWith(
+                self: *const Instance,
+                comptime event_id: EventId,
+                context: anytype,
+                comptime builder: anytype,
+                options: WriteOptions,
+                comptime submit: anytype,
+            ) WriteError!user_events.WriteOutcome {
                 if (!self.isEnabled(event_id)) return .disabled;
 
                 const payload = @call(.always_inline, builder, .{context});
                 if (@TypeOf(payload) != Payload(event_id)) {
                     @compileError("writeLazy builder must return Provider.Payload(event_id)");
                 }
-                return self.writePtr(event_id, &payload, options);
+                return self.writePtrWith(event_id, &payload, options, submit);
             }
 
             fn prepareRegistration(self: *Instance) error{RegistrationActive}!void {
@@ -1541,6 +1573,22 @@ const wire_test_spec: ProviderSpec = .{
 
 const WireTestProvider = Provider(wire_test_spec);
 
+const golden_test_spec: ProviderSpec = .{
+    .name = "Zig_Golden",
+    .events = &.{.{
+        .symbol = "golden",
+        .name = "Golden",
+        .id = 0x2345,
+        .version = 1,
+        .tag = 0x6789,
+        .opcode = 2,
+        .level = 4,
+        .fields = &.{.{ .name = "value", .kind = .u32 }},
+    }},
+};
+
+const GoldenTestProvider = Provider(golden_test_spec);
+
 const CapturedIovecs = struct {
     var bytes: [8192]u8 = undefined;
     var len: usize = 0;
@@ -1586,6 +1634,87 @@ const ExpectedBytes = struct {
         self.append(std.mem.asBytes(&value));
     }
 };
+
+// Independent literals derived from Microsoft's EventHeader ABI declaration:
+// https://github.com/microsoft/LinuxTracepoints/blob/main/libeventheader-tracepoint/include/eventheader/eventheader.h
+// The complete frame follows the Rust writer's write-index/header/activity/
+// metadata/payload ordering:
+// https://github.com/microsoft/LinuxTracepoints-Rust/blob/main/eventheader/src/_internal.rs
+const golden_header_le64 = [_]u8{
+    0x07, 0x01, 0x45, 0x23, 0x89, 0x67, 0x02, 0x04,
+};
+
+const golden_metadata_extension_le64 = [_]u8{
+    0x0e, 0x00, 0x01, 0x00,
+    0x47, 0x6f, 0x6c, 0x64,
+    0x65, 0x6e, 0x00, 0x76,
+    0x61, 0x6c, 0x75, 0x65,
+    0x00, 0x04,
+};
+
+const golden_provider_frame_le64 = [_]u8{
+    // Native user_events write index.
+    0xd4, 0xc3, 0xb2, 0xa1,
+    // EventHeader.
+    0x07, 0x01, 0x45, 0x23,
+    0x89, 0x67, 0x02, 0x04,
+    // Chained activity extension with activity and related IDs.
+    0x20, 0x00, 0x02, 0x80,
+    0x00, 0x01, 0x02, 0x03,
+    0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0a, 0x0b,
+    0x0c, 0x0d, 0x0e, 0x0f,
+    0x10, 0x11, 0x12, 0x13,
+    0x14, 0x15, 0x16, 0x17,
+    0x18, 0x19, 0x1a, 0x1b,
+    0x1c, 0x1d, 0x1e, 0x1f,
+    // Terminal metadata extension: "Golden", then uint32 "value".
+    0x0e, 0x00, 0x01, 0x00,
+    0x47, 0x6f, 0x6c, 0x64,
+    0x65, 0x6e, 0x00, 0x76,
+    0x61, 0x6c, 0x75, 0x65,
+    0x00, 0x04,
+    // uint32 payload.
+    0x01, 0xef,
+    0xcd, 0xab,
+};
+
+test "literal little-endian 64-bit EventHeader golden vectors" {
+    if (@sizeOf(usize) != 8 or builtin.cpu.arch.endian() != .little) return;
+
+    const Definition = GoldenTestProvider.Definition(.golden);
+    try std.testing.expectEqualSlices(u8, &golden_header_le64, &Definition.header);
+    try std.testing.expectEqualSlices(
+        u8,
+        &golden_metadata_extension_le64,
+        &Definition.metadata_extension,
+    );
+
+    const activity: eventheader.ActivityId = .{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    };
+    const related: eventheader.ActivityId = .{
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    };
+    const payload: GoldenTestProvider.Payload(.golden) = .{
+        .value = 0xabcdef01,
+    };
+    var event: user_events.Event = .{};
+    CapturedIovecs.reset(0xa1b2c3d4);
+    _ = try EventWriter(golden_test_spec, 0).emit(
+        &event,
+        &payload,
+        .{ .activity = &activity, .related = &related },
+        CapturedIovecs.submit,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &golden_provider_frame_le64,
+        CapturedIovecs.bytes[0..CapturedIovecs.len],
+    );
+}
 
 const WirePayloadStorage = struct {
     payload: WireTestProvider.Payload(.everything),
@@ -1853,7 +1982,7 @@ test "runtime field event and iovec limits reject before submission" {
     try std.testing.expectEqual(@as(usize, 0), RejectSubmit.calls);
 }
 
-test "writeLazy does not invoke builder while its EventSet is disabled" {
+test "disabled generated writes invoke neither builder nor submit" {
     const LazyBuilder = struct {
         fn build(calls: *usize) GeneratedTestProvider.Payload(.first) {
             calls.* += 1;
@@ -1863,14 +1992,33 @@ test "writeLazy does not invoke builder while its EventSet is disabled" {
             };
         }
     };
+    const Submit = struct {
+        var calls: usize = 0;
+
+        fn call(
+            _: *const user_events.Event,
+            _: []user_events.Iovec,
+        ) user_events.EventWriteError!user_events.WriteOutcome {
+            calls += 1;
+            return .written;
+        }
+    };
 
     var instance: GeneratedTestProvider.Instance = .{};
-    var calls: usize = 0;
+    var builder_calls: usize = 0;
+    Submit.calls = 0;
     try std.testing.expectEqual(
         user_events.WriteOutcome.disabled,
-        try instance.writeLazy(.first, &calls, LazyBuilder.build, .{}),
+        try instance.writeLazyWith(
+            .first,
+            &builder_calls,
+            LazyBuilder.build,
+            .{},
+            Submit.call,
+        ),
     );
-    try std.testing.expectEqual(@as(usize, 0), calls);
+    try std.testing.expectEqual(@as(usize, 0), builder_calls);
+    try std.testing.expectEqual(@as(usize, 0), Submit.calls);
 
     const payload: GeneratedTestProvider.Payload(.first) = .{
         .count = 3,
@@ -1878,142 +2026,325 @@ test "writeLazy does not invoke builder while its EventSet is disabled" {
     };
     try std.testing.expectEqual(
         user_events.WriteOutcome.disabled,
-        try instance.writePtr(.first, &payload, .{}),
+        try instance.writePtrWith(.first, &payload, .{}, Submit.call),
     );
+    try std.testing.expectEqual(@as(usize, 0), Submit.calls);
 }
 
-test "provider partial registration rolls back and reports cleanup failure" {
-    const FakeLifecycle = struct {
-        var register_calls: usize = 0;
-        var unregister_calls: usize = 0;
-        var close_calls: usize = 0;
-        var fail_registration: usize = 1;
-        var fail_cleanup: bool = false;
-        var names: [2][]const u8 = undefined;
+const LifecycleTestProvider = Provider(.{
+    .name = "Zig_Lifecycle",
+    .events = &.{
+        .{ .symbol = "first", .level = 3 },
+        .{ .symbol = "second", .level = 4 },
+        .{ .symbol = "third", .level = 5 },
+    },
+});
 
-        fn reset() void {
-            register_calls = 0;
-            unregister_calls = 0;
-            close_calls = 0;
-            fail_registration = 1;
-            fail_cleanup = false;
+const FakeProviderLifecycle = struct {
+    var register_calls: usize = 0;
+    var unregister_calls: usize = 0;
+    var close_calls: usize = 0;
+    var fail_registration: ?usize = null;
+    var fail_unregister_mask: u8 = 0;
+    var fail_close: bool = false;
+    var enable_addresses: [LifecycleTestProvider.event_set_count]usize = undefined;
+    var unregister_order: [16]usize = undefined;
+
+    fn reset() void {
+        register_calls = 0;
+        unregister_calls = 0;
+        close_calls = 0;
+        fail_registration = null;
+        fail_unregister_mask = 0;
+        fail_close = false;
+        enable_addresses = @splat(0);
+    }
+
+    fn clearCleanupLog() void {
+        unregister_calls = 0;
+        close_calls = 0;
+    }
+
+    fn open(data_file: *user_events.DataFile) user_events.DataFileOpenError!void {
+        data_file.fd.store(10, .release);
+    }
+
+    fn registerOne(
+        managed_event: *user_events.Event,
+        data_file: *user_events.DataFile,
+        flags: abi.RegistrationFlags,
+        name_args: [:0]const u8,
+    ) user_events.EventRegisterError!void {
+        return user_events.testing.registerEventWith(
+            managed_event,
+            data_file,
+            0,
+            flags,
+            name_args,
+            registerRaw,
+        );
+    }
+
+    fn registerRaw(
+        _: linux.fd_t,
+        enable_word: *align(@sizeOf(u32)) u32,
+        _: u5,
+        _: abi.RegistrationFlags,
+        _: [:0]const u8,
+    ) user_events.RegisterError!u32 {
+        const call = register_calls;
+        register_calls += 1;
+        if (fail_registration == call) return error.PermissionDenied;
+        enable_addresses[call] = @intFromPtr(enable_word);
+        return @intCast(100 + call);
+    }
+
+    fn unregisterOne(
+        managed_event: *user_events.Event,
+    ) user_events.EventUnregisterError!void {
+        return user_events.testing.unregisterEventWith(
+            managed_event,
+            unregisterRaw,
+        );
+    }
+
+    fn unregisterRaw(
+        _: linux.fd_t,
+        enable_word: *align(@sizeOf(u32)) u32,
+        _: u5,
+    ) user_events.UnregisterError!void {
+        const address = @intFromPtr(enable_word);
+        const event_index = for (enable_addresses, 0..) |candidate, index| {
+            if (candidate == address) break index;
+        } else unreachable;
+        unregister_order[unregister_calls] = event_index;
+        unregister_calls += 1;
+        if (fail_unregister_mask & (@as(u8, 1) << @intCast(event_index)) != 0) {
+            return error.PermissionDenied;
         }
+    }
+
+    fn closeOne(
+        data_file: *user_events.DataFile,
+    ) user_events.DataFileCloseError!void {
+        if (!data_file.isOpen()) return;
+        if (data_file.registeredEventCount() != 0) {
+            return error.EventsStillRegistered;
+        }
+        close_calls += 1;
+        data_file.fd.store(-1, .release);
+        if (fail_close) return error.InputOutput;
+    }
+};
+
+test "registration failures roll back every successful position in reverse" {
+    inline for (0..LifecycleTestProvider.event_set_count) |fail_position| {
+        var instance: LifecycleTestProvider.Instance = .{};
+        FakeProviderLifecycle.reset();
+        FakeProviderLifecycle.fail_registration = fail_position;
+
+        try std.testing.expectError(
+            error.PermissionDenied,
+            instance.registerAllWith(
+                FakeProviderLifecycle.open,
+                FakeProviderLifecycle.registerOne,
+                FakeProviderLifecycle.unregisterOne,
+                FakeProviderLifecycle.closeOne,
+            ),
+        );
+        try std.testing.expectEqual(
+            fail_position + 1,
+            FakeProviderLifecycle.register_calls,
+        );
+        try std.testing.expectEqual(
+            fail_position,
+            FakeProviderLifecycle.unregister_calls,
+        );
+        for (0..fail_position) |cleanup_index| {
+            try std.testing.expectEqual(
+                fail_position - cleanup_index - 1,
+                FakeProviderLifecycle.unregister_order[cleanup_index],
+            );
+        }
+        try std.testing.expectEqual(@as(usize, 1), FakeProviderLifecycle.close_calls);
+        try std.testing.expect(!instance.data_file.isOpen());
+        try std.testing.expectEqual(@as(u32, 0), instance.data_file.registeredEventCount());
+        for (&instance.events) |*event| try std.testing.expect(!event.isRegistered());
+    }
+}
+
+test "cleanup attempts all events and closes only after retry succeeds" {
+    var instance: LifecycleTestProvider.Instance = .{};
+    FakeProviderLifecycle.reset();
+    try instance.registerAllWith(
+        FakeProviderLifecycle.open,
+        FakeProviderLifecycle.registerOne,
+        FakeProviderLifecycle.unregisterOne,
+        FakeProviderLifecycle.closeOne,
+    );
+
+    FakeProviderLifecycle.clearCleanupLog();
+    FakeProviderLifecycle.fail_unregister_mask = 0b101;
+    try std.testing.expectError(
+        error.PermissionDenied,
+        instance.unregisterAllWith(
+            FakeProviderLifecycle.unregisterOne,
+            FakeProviderLifecycle.closeOne,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 3), FakeProviderLifecycle.unregister_calls);
+    try std.testing.expectEqualSlices(
+        usize,
+        &.{ 2, 1, 0 },
+        FakeProviderLifecycle.unregister_order[0..3],
+    );
+    try std.testing.expectEqual(@as(usize, 0), FakeProviderLifecycle.close_calls);
+    try std.testing.expect(instance.data_file.isOpen());
+    try std.testing.expectEqual(@as(u32, 2), instance.data_file.registeredEventCount());
+
+    FakeProviderLifecycle.fail_unregister_mask = 0;
+    try instance.unregisterAllWith(
+        FakeProviderLifecycle.unregisterOne,
+        FakeProviderLifecycle.closeOne,
+    );
+    try std.testing.expectEqual(@as(usize, 5), FakeProviderLifecycle.unregister_calls);
+    try std.testing.expectEqualSlices(
+        usize,
+        &.{ 2, 0 },
+        FakeProviderLifecycle.unregister_order[3..5],
+    );
+    try std.testing.expectEqual(@as(usize, 1), FakeProviderLifecycle.close_calls);
+    try std.testing.expect(!instance.data_file.isOpen());
+
+    try instance.unregisterAllWith(
+        FakeProviderLifecycle.unregisterOne,
+        FakeProviderLifecycle.closeOne,
+    );
+    try std.testing.expectEqual(@as(usize, 5), FakeProviderLifecycle.unregister_calls);
+    try std.testing.expectEqual(@as(usize, 1), FakeProviderLifecycle.close_calls);
+}
+
+test "rollback and close failures retain retryable cleanup state" {
+    var rollback_instance: LifecycleTestProvider.Instance = .{};
+    FakeProviderLifecycle.reset();
+    FakeProviderLifecycle.fail_registration = 2;
+    FakeProviderLifecycle.fail_unregister_mask = 0b010;
+    try std.testing.expectError(
+        error.RollbackFailed,
+        rollback_instance.registerAllWith(
+            FakeProviderLifecycle.open,
+            FakeProviderLifecycle.registerOne,
+            FakeProviderLifecycle.unregisterOne,
+            FakeProviderLifecycle.closeOne,
+        ),
+    );
+    try std.testing.expectEqual(error.PermissionDenied, rollback_instance.cleanupError().?);
+    try std.testing.expectEqualSlices(
+        usize,
+        &.{ 1, 0 },
+        FakeProviderLifecycle.unregister_order[0..2],
+    );
+    try std.testing.expect(rollback_instance.data_file.isOpen());
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        rollback_instance.data_file.registeredEventCount(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), FakeProviderLifecycle.close_calls);
+
+    FakeProviderLifecycle.fail_unregister_mask = 0;
+    try rollback_instance.unregisterAllWith(
+        FakeProviderLifecycle.unregisterOne,
+        FakeProviderLifecycle.closeOne,
+    );
+    try std.testing.expect(!rollback_instance.data_file.isOpen());
+
+    var close_instance: LifecycleTestProvider.Instance = .{};
+    FakeProviderLifecycle.reset();
+    try close_instance.registerAllWith(
+        FakeProviderLifecycle.open,
+        FakeProviderLifecycle.registerOne,
+        FakeProviderLifecycle.unregisterOne,
+        FakeProviderLifecycle.closeOne,
+    );
+    FakeProviderLifecycle.clearCleanupLog();
+    FakeProviderLifecycle.fail_close = true;
+    try std.testing.expectError(
+        error.InputOutput,
+        close_instance.unregisterAllWith(
+            FakeProviderLifecycle.unregisterOne,
+            FakeProviderLifecycle.closeOne,
+        ),
+    );
+    try std.testing.expect(!close_instance.data_file.isOpen());
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        close_instance.data_file.registeredEventCount(),
+    );
+
+    FakeProviderLifecycle.fail_close = false;
+    try close_instance.unregisterAllWith(
+        FakeProviderLifecycle.unregisterOne,
+        FakeProviderLifecycle.closeOne,
+    );
+    try std.testing.expectEqual(@as(usize, 1), FakeProviderLifecycle.close_calls);
+    try std.testing.expect(!close_instance.data_file.isOpen());
+}
+
+test "provider lifecycle contention returns busy using atomic handshakes" {
+    const Blocking = struct {
+        var entered: std.atomic.Value(bool) = .init(false);
+        var release: std.atomic.Value(bool) = .init(false);
+        var result: std.atomic.Value(u8) = .init(0);
 
         fn open(data_file: *user_events.DataFile) user_events.DataFileOpenError!void {
             data_file.fd.store(10, .release);
+            entered.store(true, .release);
+            while (!release.load(.acquire)) {
+                std.atomic.spinLoopHint();
+                std.Thread.yield() catch {};
+            }
         }
 
-        fn registerOne(
-            managed_event: *user_events.Event,
-            data_file: *user_events.DataFile,
-            flags: abi.RegistrationFlags,
-            name_args: [:0]const u8,
-        ) user_events.EventRegisterError!void {
-            return user_events.testing.registerEventWith(
-                managed_event,
-                data_file,
-                0,
-                flags,
-                name_args,
-                registerRaw,
-            );
-        }
-
-        fn registerRaw(
-            _: linux.fd_t,
-            _: *align(@sizeOf(u32)) u32,
-            _: u5,
-            _: abi.RegistrationFlags,
-            name_args: [:0]const u8,
-        ) user_events.RegisterError!u32 {
-            const call = register_calls;
-            names[call] = name_args;
-            register_calls += 1;
-            if (call == fail_registration) return error.PermissionDenied;
-            return @intCast(100 + call);
-        }
-
-        fn unregisterOne(
-            managed_event: *user_events.Event,
-        ) user_events.EventUnregisterError!void {
-            return user_events.testing.unregisterEventWith(
-                managed_event,
-                unregisterRaw,
-            );
-        }
-
-        fn unregisterRaw(
-            _: linux.fd_t,
-            _: *align(@sizeOf(u32)) u32,
-            _: u5,
-        ) user_events.UnregisterError!void {
-            unregister_calls += 1;
-            if (fail_cleanup) return error.PermissionDenied;
-        }
-
-        fn closeOne(
-            data_file: *user_events.DataFile,
-        ) user_events.DataFileCloseError!void {
-            return user_events.testing.closeDataFileWith(data_file, closeRaw);
-        }
-
-        fn closeRaw(_: linux.fd_t) usize {
-            close_calls += 1;
-            return 0;
+        fn register(instance: *LifecycleTestProvider.Instance) void {
+            instance.registerAllWith(
+                open,
+                FakeProviderLifecycle.registerOne,
+                FakeProviderLifecycle.unregisterOne,
+                FakeProviderLifecycle.closeOne,
+            ) catch {
+                result.store(2, .release);
+                return;
+            };
+            result.store(1, .release);
         }
     };
 
-    var instance: GeneratedTestProvider.Instance = .{};
-    FakeLifecycle.reset();
+    var instance: LifecycleTestProvider.Instance = .{};
+    FakeProviderLifecycle.reset();
+    Blocking.entered.store(false, .monotonic);
+    Blocking.release.store(false, .monotonic);
+    Blocking.result.store(0, .monotonic);
+
+    const registering = try std.Thread.spawn(.{}, Blocking.register, .{&instance});
+    while (!Blocking.entered.load(.acquire)) {
+        std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
+    }
     try std.testing.expectError(
-        error.PermissionDenied,
+        error.LifecycleBusy,
         instance.registerAllWith(
-            FakeLifecycle.open,
-            FakeLifecycle.registerOne,
-            FakeLifecycle.unregisterOne,
-            FakeLifecycle.closeOne,
+            FakeProviderLifecycle.open,
+            FakeProviderLifecycle.registerOne,
+            FakeProviderLifecycle.unregisterOne,
+            FakeProviderLifecycle.closeOne,
         ),
     );
-    try std.testing.expectEqual(@as(usize, 2), FakeLifecycle.register_calls);
-    try std.testing.expectEqual(@as(usize, 1), FakeLifecycle.unregister_calls);
-    try std.testing.expectEqual(@as(usize, 1), FakeLifecycle.close_calls);
-    try std.testing.expect(!instance.data_file.isOpen());
-    try std.testing.expect(!instance.events[0].isRegistered());
-    try std.testing.expectEqualStrings(
-        GeneratedTestProvider.event_sets[0].registration_args,
-        FakeLifecycle.names[0],
-    );
-    try std.testing.expectEqualStrings(
-        GeneratedTestProvider.event_sets[1].registration_args,
-        FakeLifecycle.names[1],
-    );
+    Blocking.release.store(true, .release);
+    registering.join();
+    try std.testing.expectEqual(@as(u8, 1), Blocking.result.load(.acquire));
 
-    FakeLifecycle.reset();
-    FakeLifecycle.fail_cleanup = true;
-    try std.testing.expectError(
-        error.RollbackFailed,
-        instance.registerAllWith(
-            FakeLifecycle.open,
-            FakeLifecycle.registerOne,
-            FakeLifecycle.unregisterOne,
-            FakeLifecycle.closeOne,
-        ),
-    );
-    try std.testing.expectEqual(error.PermissionDenied, instance.cleanupError().?);
-    try std.testing.expect(instance.data_file.isOpen());
-    try std.testing.expect(instance.events[0].isRegistered());
-    try std.testing.expectEqual(@as(u32, 1), instance.data_file.registeredEventCount());
-    try std.testing.expectEqual(@as(usize, 0), FakeLifecycle.close_calls);
-
-    FakeLifecycle.fail_cleanup = false;
     try instance.unregisterAllWith(
-        FakeLifecycle.unregisterOne,
-        FakeLifecycle.closeOne,
+        FakeProviderLifecycle.unregisterOne,
+        FakeProviderLifecycle.closeOne,
     );
-    try instance.unregisterAllWith(
-        FakeLifecycle.unregisterOne,
-        FakeLifecycle.closeOne,
-    );
-    try std.testing.expect(!instance.data_file.isOpen());
-    try std.testing.expect(!instance.events[0].isRegistered());
 }
