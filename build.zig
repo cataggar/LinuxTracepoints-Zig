@@ -23,21 +23,93 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const decode_module = b.addModule("linux_tracepoints_decode", .{
+        .root_source_file = b.path("src/decode.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const module_tests = b.addTest(.{
         .root_module = module,
         .filters = test_filters,
     });
     const run_module_tests = b.addRunArtifact(module_tests);
+    const decode_tests = b.addTest(.{
+        .name = "linux-tracepoints-decode-tests",
+        .root_module = decode_module,
+        .filters = test_filters,
+    });
+    const run_decode_tests = b.addRunArtifact(decode_tests);
 
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_module_tests.step);
+    test_step.dependOn(&run_decode_tests.step);
+
+    const decode_test_step = b.step(
+        "test-decode",
+        "Run portable decoder tests",
+    );
+    decode_test_step.dependOn(&run_decode_tests.step);
 
     const test_compile_step = b.step(
         "test-compile",
         "Compile library tests without running them",
     );
     test_compile_step.dependOn(&module_tests.step);
+    test_compile_step.dependOn(&decode_tests.step);
+
+    const portable_target = b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = .freestanding,
+        .abi = .none,
+    });
+    const portable_decode_module = b.createModule(.{
+        .root_source_file = b.path("src/decode.zig"),
+        .target = portable_target,
+        .optimize = optimize,
+    });
+    const portable_probe_module = b.createModule(.{
+        .root_source_file = b.path("tests/portable_decode.zig"),
+        .target = portable_target,
+        .optimize = optimize,
+    });
+    portable_probe_module.addImport(
+        "linux_tracepoints_decode",
+        portable_decode_module,
+    );
+    const portable_probe = b.addObject(.{
+        .name = "linux-tracepoints-decode-freestanding",
+        .root_module = portable_probe_module,
+    });
+    const portable_wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+        .abi = .none,
+    });
+    const portable_wasm_decode_module = b.createModule(.{
+        .root_source_file = b.path("src/decode.zig"),
+        .target = portable_wasm_target,
+        .optimize = optimize,
+    });
+    const portable_wasm_probe_module = b.createModule(.{
+        .root_source_file = b.path("tests/portable_decode.zig"),
+        .target = portable_wasm_target,
+        .optimize = optimize,
+    });
+    portable_wasm_probe_module.addImport(
+        "linux_tracepoints_decode",
+        portable_wasm_decode_module,
+    );
+    const portable_wasm_probe = b.addObject(.{
+        .name = "linux-tracepoints-decode-wasm32-freestanding",
+        .root_module = portable_wasm_probe_module,
+    });
+    const portable_step = b.step(
+        "test-decode-portable",
+        "Compile the decoder for x86_64- and wasm32-freestanding",
+    );
+    portable_step.dependOn(&portable_probe.step);
+    portable_step.dependOn(&portable_wasm_probe.step);
 
     const compile_fail_step = b.step(
         "test-compile-fail",
