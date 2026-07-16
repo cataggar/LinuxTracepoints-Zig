@@ -86,6 +86,10 @@ const writer_count_mask: u32 = writer_closing - 1;
 const rawRegister = register;
 const rawUnregister = unregister;
 
+pub const max_iovecs: usize = linux.IOV_MAX;
+pub const Iovec = std.posix.iovec_const;
+pub const max_registration_description_len: usize = max_name_args_len;
+
 const LinuxFutex = struct {
     fn wait(ptr: *align(@alignOf(u32)) const u32, expected: u32) void {
         while (true) {
@@ -253,6 +257,16 @@ pub const Event = struct {
         return self.writeTypedWith(Payload, payload, linux.writev);
     }
 
+    /// Managed vectored write. `vectors[0]` is reserved for the native-endian
+    /// user-events write index and is overwritten before the syscall. Remaining
+    /// vectors are emitted without copying.
+    pub fn writev(
+        self: *const Event,
+        vectors: []Iovec,
+    ) EventWriteError!WriteOutcome {
+        return self.writevWith(vectors, linux.writev);
+    }
+
     pub fn isRegistered(self: *const Event) bool {
         return self.registered.load(.acquire);
     }
@@ -369,6 +383,29 @@ pub const Event = struct {
         const fd = data_file.fd.load(.acquire);
         if (fd == closed_fd) return error.DataFileClosed;
         writeTypedEnabledWith(fd, self.write_index, Payload, payload, writevFn) catch |err| switch (err) {
+            error.DisabledOrInvalidFileDescriptor => {
+                if (!userEventIsEnabled(&self.enable_word, enable_bit)) return .disabled;
+                return err;
+            },
+            else => return err,
+        };
+        return .written;
+    }
+
+    fn writevWith(
+        self: *const Event,
+        vectors: []Iovec,
+        comptime writevFn: anytype,
+    ) EventWriteError!WriteOutcome {
+        const enable_bit = self.currentEnableBit();
+        if (!userEventIsEnabled(&self.enable_word, enable_bit)) return .disabled;
+        try self.enterWriter();
+        defer self.leaveWriter();
+
+        const data_file = self.data_file orelse return error.EventNotRegistered;
+        const fd = data_file.fd.load(.acquire);
+        if (fd == closed_fd) return error.DataFileClosed;
+        writevEnabledWith(fd, self.write_index, vectors, writevFn) catch |err| switch (err) {
             error.DisabledOrInvalidFileDescriptor => {
                 if (!userEventIsEnabled(&self.enable_word, enable_bit)) return .disabled;
                 return err;
@@ -747,6 +784,76 @@ fn writeTypedEnabledWith(
     }
 }
 
+fn writevEnabledWith(
+    fd: linux.fd_t,
+    write_index: u32,
+    vectors: []Iovec,
+    comptime writevFn: anytype,
+) WriteError!void {
+    if (vectors.len == 0 or vectors.len > max_iovecs) {
+        return error.InvalidArgument;
+    }
+
+    var index = write_index;
+    vectors[0] = .{
+        .base = std.mem.asBytes(&index).ptr,
+        .len = @sizeOf(u32),
+    };
+
+    var expected: usize = 0;
+    for (vectors) |vector| {
+        if (vector.len > std.math.maxInt(usize) - expected) {
+            return error.PayloadTooLarge;
+        }
+        expected += vector.len;
+    }
+
+    while (true) {
+        const result = writevFn(fd, vectors.ptr, vectors.len);
+        switch (linux.errno(result)) {
+            .SUCCESS => {
+                if (result != expected) return error.ShortWrite;
+                return;
+            },
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .BADF => return error.DisabledOrInvalidFileDescriptor,
+            .NOENT => return error.NotRegistered,
+            .INVAL => return error.InvalidArgument,
+            .FAULT => return error.InvalidMemory,
+            .NOMEM, .NOBUFS => return error.SystemResources,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+pub const testing = if (builtin.is_test) struct {
+    pub fn registerEventWith(
+        event: *Event,
+        data_file: *DataFile,
+        enable_bit: u5,
+        flags: abi.RegistrationFlags,
+        name_args: [:0]const u8,
+        comptime registerFn: anytype,
+    ) EventRegisterError!void {
+        return event.registerWith(data_file, enable_bit, flags, name_args, registerFn);
+    }
+
+    pub fn unregisterEventWith(
+        event: *Event,
+        comptime unregisterFn: anytype,
+    ) EventUnregisterError!void {
+        return event.unregisterWith(unregisterFn);
+    }
+
+    pub fn closeDataFileWith(
+        data_file: *DataFile,
+        comptime closeFn: anytype,
+    ) DataFileCloseError!void {
+        return data_file.closeWith(closeFn);
+    }
+} else struct {};
+
 test "enabled check selects the requested bit" {
     var enable_word: u32 align(@sizeOf(u32)) = 0;
     try std.testing.expect(!isEnabled(&enable_word, 5));
@@ -900,6 +1007,127 @@ test "disabled managed typed write does not invoke writev" {
         try event.writeTypedWith(Payload, &payload, FakeWritev.call),
     );
     try std.testing.expectEqual(@as(usize, 0), FakeWritev.calls);
+}
+
+test "managed vectored write gates lifetime prefixes index and retries EINTR" {
+    const Fake = struct {
+        var write_calls: usize = 0;
+        var observed_index: u32 = 0;
+        var observed_payload: [16]u8 = undefined;
+        var observed_payload_len: usize = 0;
+
+        fn registerCall(
+            _: linux.fd_t,
+            _: *align(@sizeOf(u32)) u32,
+            _: u5,
+            _: abi.RegistrationFlags,
+            _: [:0]const u8,
+        ) RegisterError!u32 {
+            return 0x12345678;
+        }
+
+        fn unregisterCall(
+            _: linux.fd_t,
+            _: *align(@sizeOf(u32)) u32,
+            _: u5,
+        ) UnregisterError!void {}
+
+        fn writevCall(
+            _: linux.fd_t,
+            vectors: [*]const Iovec,
+            count: usize,
+        ) usize {
+            write_calls += 1;
+            std.debug.assert(count == 3);
+            if (write_calls == 1) return errnoResult(.INTR);
+
+            observed_index = @bitCast(vectors[0].base[0..@sizeOf(u32)].*);
+            observed_payload_len = 0;
+            for (vectors[1..count]) |vector| {
+                @memcpy(
+                    observed_payload[observed_payload_len..][0..vector.len],
+                    vector.base[0..vector.len],
+                );
+                observed_payload_len += vector.len;
+            }
+            return vectors[0].len + vectors[1].len + vectors[2].len;
+        }
+    };
+
+    var data_file: DataFile = .{ .fd = .init(10) };
+    var event: Event = .{};
+    try event.registerWith(&data_file, 2, .{}, "zig_iovecs", Fake.registerCall);
+    @atomicStore(u32, &event.enable_word, @as(u32, 1) << 2, .release);
+
+    var vectors: [3]Iovec = .{
+        undefined,
+        .{ .base = "abc".ptr, .len = 3 },
+        .{ .base = "de".ptr, .len = 2 },
+    };
+    Fake.write_calls = 0;
+    try std.testing.expectEqual(
+        WriteOutcome.written,
+        try event.writevWith(&vectors, Fake.writevCall),
+    );
+    try std.testing.expectEqual(@as(usize, 2), Fake.write_calls);
+    try std.testing.expectEqual(@as(u32, 0x12345678), Fake.observed_index);
+    try std.testing.expectEqualStrings(
+        "abcde",
+        Fake.observed_payload[0..Fake.observed_payload_len],
+    );
+
+    try event.unregisterWith(Fake.unregisterCall);
+}
+
+test "managed vectored write keeps disabled path first" {
+    const FakeWritev = struct {
+        var calls: usize = 0;
+
+        fn call(
+            _: linux.fd_t,
+            _: [*]const Iovec,
+            _: usize,
+        ) usize {
+            calls += 1;
+            return 0;
+        }
+    };
+
+    var event: Event = .{};
+    var no_vectors: [0]Iovec = .{};
+    FakeWritev.calls = 0;
+    try std.testing.expectEqual(
+        WriteOutcome.disabled,
+        try event.writevWith(&no_vectors, FakeWritev.call),
+    );
+    try std.testing.expectEqual(@as(usize, 0), FakeWritev.calls);
+}
+
+test "managed vectored primitive reports invalid counts and short writes" {
+    const FakeWritev = struct {
+        fn call(
+            _: linux.fd_t,
+            _: [*]const Iovec,
+            _: usize,
+        ) usize {
+            return 1;
+        }
+    };
+
+    var empty: [0]Iovec = .{};
+    try std.testing.expectError(
+        error.InvalidArgument,
+        writevEnabledWith(10, 1, &empty, FakeWritev.call),
+    );
+
+    var vectors: [2]Iovec = .{
+        undefined,
+        .{ .base = "abc".ptr, .len = 3 },
+    };
+    try std.testing.expectError(
+        error.ShortWrite,
+        writevEnabledWith(10, 1, &vectors, FakeWritev.call),
+    );
 }
 
 test "data file close is idempotent and refuses active registrations" {
