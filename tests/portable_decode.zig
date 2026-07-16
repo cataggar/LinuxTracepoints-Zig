@@ -19,6 +19,16 @@ export fn linuxTracepointsDecodePortableParsers(
         if ((fields.next() catch null) != null) decoded += 1;
     } else |_| {}
 
+    if (decode.perf_data.parseRecord(data, .little)) |record| {
+        decoded += 1;
+        _ = decode.perf_data.decodeSampleWithLayout(
+            record,
+            .{ .sample_type = 0 },
+            .{ .max_bytes = 4096 },
+        ) catch null;
+        _ = decode.perf_data.decodeLost(record, .little) catch null;
+    } else |_| {}
+
     if (decode.perf_data.parse(data, .{ .max_bytes = 4096 })) |file| {
         var records = file.recordIterator();
         if (records.next() catch null) |record| {

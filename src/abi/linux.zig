@@ -8,6 +8,8 @@ comptime {
     }
 }
 
+pub const perf = @import("perf.zig");
+
 pub const enable_word_size: u8 = @sizeOf(u32);
 
 pub const RegistrationFlags = packed struct(u16) {
@@ -135,4 +137,13 @@ test "registration structures use the kernel ABI" {
 test "write index bytes use native endian" {
     const index: u32 = 0x12345678;
     try std.testing.expectEqual(index, @as(u32, @bitCast(writeIndexBytes(index))));
+}
+
+test {
+    if (@sizeOf(usize) == 8 and
+        (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64) and
+        builtin.cpu.arch.endian() == .little)
+    {
+        _ = perf;
+    }
 }
