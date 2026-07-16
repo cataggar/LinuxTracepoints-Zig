@@ -58,6 +58,48 @@ pub fn build(b: *std.Build) void {
     test_compile_step.dependOn(&module_tests.step);
     test_compile_step.dependOn(&decode_tests.step);
 
+    const perf_compile_step = b.step(
+        "test-perf-compile",
+        "Compile Linux collector tests for x86_64 and AArch64",
+    );
+    const perf_compile_targets = [_]struct {
+        name: []const u8,
+        query: std.Target.Query,
+    }{
+        .{
+            .name = "x86_64",
+            .query = .{
+                .cpu_arch = .x86_64,
+                .os_tag = .linux,
+                .abi = .none,
+            },
+        },
+        .{
+            .name = "aarch64",
+            .query = .{
+                .cpu_arch = .aarch64,
+                .os_tag = .linux,
+                .abi = .none,
+            },
+        },
+    };
+    for (perf_compile_targets) |compile_target| {
+        const perf_target_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = b.resolveTargetQuery(compile_target.query),
+            .optimize = optimize,
+        });
+        const perf_target_tests = b.addTest(.{
+            .name = b.fmt(
+                "linux-tracepoints-perf-{s}-tests",
+                .{compile_target.name},
+            ),
+            .root_module = perf_target_module,
+        });
+        perf_compile_step.dependOn(&perf_target_tests.step);
+    }
+    test_compile_step.dependOn(perf_compile_step);
+
     const portable_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
         .os_tag = .freestanding,

@@ -48,6 +48,7 @@ pub const SampleType = struct {
 };
 
 pub const RecordType = struct {
+    pub const lost: u32 = 2;
     pub const sample: u32 = 9;
     pub const auxtrace: u32 = 71;
 };
@@ -414,6 +415,31 @@ pub const Record = struct {
     }
 };
 
+/// Parses the first perf record in `data`.
+///
+/// Unlike `RecordIterator`, this does not reject records whose payload is
+/// stored outside a normal perf.data data section. This makes it suitable for
+/// records copied directly from a perf mmap ring.
+pub fn parseRecord(data: []const u8, endian: Endian) Error!Record {
+    if (data.len < record_header_size) return error.Truncated;
+
+    var cursor = bytes.Cursor.init(data, endian);
+    const record_type = try cursor.readU32();
+    const misc = try cursor.readU16();
+    const size = try cursor.readU16();
+    if (size < record_header_size) return error.InvalidFormat;
+    if (size > data.len) return error.Truncated;
+
+    const record_bytes = data[0..size];
+    return .{
+        .type = record_type,
+        .misc = misc,
+        .size = size,
+        .bytes = record_bytes,
+        .payload = record_bytes[record_header_size..],
+    };
+}
+
 pub const RecordIterator = struct {
     data: []const u8,
     endian: Endian,
@@ -424,30 +450,15 @@ pub const RecordIterator = struct {
     pub fn next(self: *RecordIterator) Error!?Record {
         if (self.position == self.data.len) return null;
         if (self.count >= self.max_records) return error.LimitExceeded;
-        if (self.position > self.data.len or
-            record_header_size > self.data.len - self.position)
-        {
-            return error.Truncated;
-        }
-        var cursor = bytes.Cursor.init(self.data[self.position..], self.endian);
-        const record_type = try cursor.readU32();
-        const misc = try cursor.readU16();
-        const size = try cursor.readU16();
-        if (size < record_header_size) return error.InvalidFormat;
-        if (size > self.data.len - self.position) return error.Truncated;
-        if (record_type == RecordType.auxtrace) {
+        if (self.position > self.data.len) return error.Truncated;
+
+        const record = try parseRecord(self.data[self.position..], self.endian);
+        if (record.type == RecordType.auxtrace) {
             return error.UnsupportedLayout;
         }
-        const record_bytes = self.data[self.position .. self.position + size];
-        self.position += size;
+        self.position += record.size;
         self.count += 1;
-        return .{
-            .type = record_type,
-            .misc = misc,
-            .size = size,
-            .bytes = record_bytes,
-            .payload = record_bytes[record_header_size..],
-        };
+        return record;
     }
 };
 
@@ -463,7 +474,15 @@ pub const Sample = struct {
     cpu: ?u32 = null,
     cpu_reserved: ?u32 = null,
     period: ?u64 = null,
+    /// Kernel-declared RAW bytes. Linux includes any padding used to align the
+    /// end of this field in the declared size, so the pre-padding source length
+    /// cannot be recovered from the perf ABI alone.
     raw: ?[]const u8 = null,
+};
+
+pub const SampleLayout = struct {
+    sample_type: u64,
+    endian: Endian = .little,
 };
 
 pub fn decodeSample(
@@ -472,7 +491,23 @@ pub fn decodeSample(
     limits: Limits,
 ) Error!Sample {
     if (!record.isSample()) return error.UnsupportedLayout;
-    const sample_type = try attr.sampleType();
+    return decodeSampleWithLayout(
+        record,
+        .{
+            .sample_type = try attr.sampleType(),
+            .endian = attr.endian,
+        },
+        limits,
+    );
+}
+
+pub fn decodeSampleWithLayout(
+    record: Record,
+    layout: SampleLayout,
+    limits: Limits,
+) Error!Sample {
+    if (!record.isSample()) return error.UnsupportedLayout;
+    const sample_type = layout.sample_type;
     if (sample_type & SampleType.unsupported_before_raw != 0) {
         return error.UnsupportedLayout;
     }
@@ -481,7 +516,7 @@ pub fn decodeSample(
     }
 
     var result = Sample{};
-    var cursor = bytes.Cursor.init(record.payload, attr.endian);
+    var cursor = bytes.Cursor.init(record.payload, layout.endian);
     if (sample_type & SampleType.identifier != 0) {
         result.identifier = try cursor.readU64();
     }
@@ -506,10 +541,29 @@ pub fn decodeSample(
         const raw_size_usize: usize = raw_size;
         if (raw_size_usize > limits.max_bytes) return error.LimitExceeded;
         result.raw = try cursor.readSlice(raw_size_usize);
+        // perf_sample_save_raw_data() rounds `u32 size + source bytes` to
+        // u64, then reports the alignment bytes as part of `size`. There is
+        // no second, implicit padding region to consume here.
         if (cursor.position & 7 != 0) return error.InvalidFormat;
     }
     if (!cursor.atEnd()) return error.InvalidFormat;
     return result;
+}
+
+pub const Lost = struct {
+    id: u64,
+    count: u64,
+};
+
+pub fn decodeLost(record: Record, endian: Endian) Error!Lost {
+    if (record.type != RecordType.lost) return error.UnsupportedLayout;
+    if (record.payload.len < 2 * @sizeOf(u64)) return error.InvalidFormat;
+
+    var cursor = bytes.Cursor.init(record.payload, endian);
+    return .{
+        .id = try cursor.readU64(),
+        .count = try cursor.readU64(),
+    };
 }
 
 pub const SessionIndex = struct {
@@ -752,7 +806,7 @@ const Fixture = struct {
         fixture.storage[position + 4] = 0xaa;
         fixture.storage[position + 5] = 0xbb;
         fixture.storage[position + 6] = 0xcc;
-        fixture.storage[position + 7] = 0xee;
+        fixture.storage[position + 7] = 0;
 
         if (with_feature) {
             putU64(&fixture.storage, descriptor_offset, feature_offset, endian);
@@ -803,7 +857,7 @@ test "parses little-endian attrs IDs unknown feature records and sample order" {
     try std.testing.expectEqual(@as(?u64, 14), sample.period);
     try std.testing.expectEqualSlices(
         u8,
-        &.{ 0xaa, 0xbb, 0xcc, 0xee },
+        &.{ 0xaa, 0xbb, 0xcc, 0 },
         sample.raw.?,
     );
 
@@ -839,7 +893,7 @@ test "parses big-endian header attrs IDs and sample payload" {
     try std.testing.expectEqual(@as(?u32, 10), sample.pid);
     try std.testing.expectEqualSlices(
         u8,
-        &.{ 0xaa, 0xbb, 0xcc, 0xee },
+        &.{ 0xaa, 0xbb, 0xcc, 0 },
         sample.raw.?,
     );
 }
@@ -925,7 +979,7 @@ test "accepts historical headers and normalizes ABI0 attr size" {
     try std.testing.expectEqual(@as(u64, 0x1122334455667788), try attr.config());
 }
 
-test "PERF_SAMPLE_RAW declared bytes include ABI alignment" {
+test "PERF_SAMPLE_RAW declared size includes kernel alignment bytes" {
     var fixture = Fixture.init(.little, false);
     const file = try parse(fixture.bytes(), .{});
     const attr = try file.attrAt(0);
@@ -933,7 +987,7 @@ test "PERF_SAMPLE_RAW declared bytes include ABI alignment" {
     const sample = try decodeSample((try records.next()).?, attr, .{});
     try std.testing.expectEqualSlices(
         u8,
-        &.{ 0xaa, 0xbb, 0xcc, 0xee },
+        &.{ 0xaa, 0xbb, 0xcc, 0 },
         sample.raw.?,
     );
 
@@ -950,6 +1004,44 @@ test "PERF_SAMPLE_RAW declared bytes include ABI alignment" {
             .{},
         ),
     );
+}
+
+test "PERF_SAMPLE_RAW source lengths use declared in-size padding" {
+    inline for ([_]usize{ 0, 1, 3, 7, 8 }) |source_len| {
+        const declared_len = std.mem.alignForward(
+            usize,
+            source_len + @sizeOf(u32),
+            @sizeOf(u64),
+        ) - @sizeOf(u32);
+        const record_len = record_header_size + @sizeOf(u32) + declared_len;
+        var storage = [_]u8{0} ** 32;
+
+        putU32(&storage, 0, RecordType.sample, .little);
+        putU16(&storage, 4, 0, .little);
+        putU16(&storage, 6, @intCast(record_len), .little);
+        putU32(&storage, record_header_size, @intCast(declared_len), .little);
+        for (0..source_len) |index| {
+            storage[record_header_size + @sizeOf(u32) + index] =
+                @intCast(0xa0 + index);
+        }
+
+        const record = try parseRecord(storage[0..record_len], .little);
+        const sample = try decodeSampleWithLayout(
+            record,
+            .{ .sample_type = SampleType.raw },
+            .{},
+        );
+        try std.testing.expectEqual(declared_len, sample.raw.?.len);
+        for (0..source_len) |index| {
+            try std.testing.expectEqual(
+                @as(u8, @intCast(0xa0 + index)),
+                sample.raw.?[index],
+            );
+        }
+        for (sample.raw.?[source_len..]) |padding| {
+            try std.testing.expectEqual(@as(u8, 0), padding);
+        }
+    }
 }
 
 test "recognizes pipe mode section overflow and unsupported sample prefixes" {
