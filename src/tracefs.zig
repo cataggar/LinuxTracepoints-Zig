@@ -57,7 +57,7 @@ pub fn openUserEventsDataAt(path: [:0]const u8) OpenError!linux.fd_t {
 }
 
 fn openUserEventsDataWith(comptime Sys: type) OpenError!linux.fd_t {
-    inline for (conventional_paths) |path| {
+    for (conventional_paths) |path| {
         return openCandidateWith(Sys, path) catch |err| switch (err) {
             error.NotFound => continue,
             else => |open_err| return open_err,
